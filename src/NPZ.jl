@@ -236,17 +236,17 @@ If it is specified, only the matching variables are read in from the file.
 # Examples
 
 ```julia
-julia> npzwriteto("temp.npz", x = ones(3), y = 3)
+julia> npzwrite("temp.npz", x = ones(3), y = 3)
 
 julia> open("temp.npz", "rb") do f
-    return npzreadfrom(f) # Reads all variables
+    npzreadfrom(f) # Reads all variables
 end
 Dict{String,Any} with 2 entries:
   "x" => [1.0, 1.0, 1.0]
   "y" => 3
 
 julia> open("temp.npz", "rb") do f
-    return npzreadfrom(f, ["x"]) # Reads only "x"
+    npzreadfrom(f, ["x"]) # Reads only "x"
 end
 Dict{String,Array{Float64,1}} with 1 entry:
   "x" => [1.0, 1.0, 1.0]
@@ -361,6 +361,27 @@ function readheader(dir::ZipFile.Reader,
             if f.name in vars || _maybetrimext(f.name) in vars)
 end
 
+
+"""
+    npzwriteto(file::IO, x)
+
+Write the variable `x` to the `npy` file `file`. 
+The file should be open in writable binary mode "wb".
+
+# Examples
+
+```julia
+julia> open("abc.npy", "wb") do f
+    npzwriteto(f, zeros(3))
+end
+
+julia> npzread("abc.npy")
+3-element Array{Float64,1}:
+ 0.0
+ 0.0
+ 0.0
+```
+"""
 function npzwriteto(
     f::IO, x::AbstractArray{UInt8}, T::DataType, shape)
 
@@ -388,26 +409,6 @@ function npzwriteto(
     end
 end
 
-"""
-    npzwriteto(file::IO, x)
-
-Write the variable `x` to the `npy` file `file`. 
-The file should be open in writable binary mode "wb".
-
-# Examples
-
-```julia
-julia> open("abc.npy", "wb") do f
-    npzwriteto(f, zeros(3))
-end
-
-julia> npzread("abc.npy")
-3-element Array{Float64,1}:
- 0.0
- 0.0
- 0.0
-```
-"""
 function npzwriteto(f::IO, x::AbstractArray)
     npzwriteto(f, reinterpret(UInt8, vec(x)), eltype(x), size(x))
 end
