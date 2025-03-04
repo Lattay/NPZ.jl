@@ -4,6 +4,7 @@ module NPZ
 # https://github.com/numpy/numpy/blob/v1.7.0/numpy/lib/format.py
 
 using ZipFile, FileIO
+import LegacyStrings: utf32, empty_utf32
 import Base.CodeUnits
 
 export npzread, npzwrite
@@ -29,13 +30,14 @@ const TypeMaps = [
     ("f8", Float64),
     ("c8", Complex{Float32}),
     ("c16", Complex{Float64}),
+    ("U*", String),
 ]
-const Numpy2Julia = Dict{String, DataType}(s => t for (s, t) in TypeMaps)
+const Numpy2Julia = Dict{String,DataType}(s => t for (s, t) in TypeMaps)
 
-const Julia2Numpy = Dict{DataType, String}()
+const Julia2Numpy = Dict{DataType,String}()
 
 function __init__()
-    for (s,t) in TypeMaps
+    for (s, t) in TypeMaps
         Julia2Numpy[t] = s
     end
 end
@@ -48,7 +50,7 @@ end
 # be fixed by rehashing the Dict when the module is
 # loaded.
 
-readle(ios::IO, ::Type{T}) where T = ltoh(read(ios, T)) # ltoh is inverse of htol
+readle(ios::IO, ::Type{T}) where {T} = ltoh(read(ios, T)) # ltoh is inverse of htol
 
 function writecheck(io::IO, x::Any)
     n = write(io, x) # returns size in bytes
@@ -57,7 +59,7 @@ end
 
 # Endianness only pertains to multi-byte things
 writele(ios::IO, x::AbstractVector{UInt8}) = writecheck(ios, x)
-writele(ios::IO, x::AbstractVector{CodeUnits{UInt8, <:Any}}) = writecheck(ios, x)
+writele(ios::IO, x::AbstractVector{CodeUnits{UInt8,<:Any}}) = writecheck(ios, x)
 # codeunits returns vector of CodeUnits in 7+, uint in 6
 writele(ios::IO, x::AbstractString) = writele(ios, codeunits(x))
 
@@ -65,7 +67,7 @@ writele(ios::IO, x::UInt16) = writecheck(ios, htol(x))
 
 function parsechar(s::AbstractString, c::Char)
     firstchar = s[firstindex(s)]
-    if  firstchar != c
+    if firstchar != c
         error("parsing header failed: expected character '$c', found '$firstchar'")
     end
     SubString(s, nextind(s, 1))
@@ -73,7 +75,7 @@ end
 
 function parsestring(s::AbstractString)
     s = parsechar(s, '\'')
-    parts = split(s, '\'', limit = 2)
+    parts = split(s, '\'', limit=2)
     length(parts) != 2 && error("parsing header failed: malformed string")
     parts[1], parts[2]
 end
@@ -122,6 +124,22 @@ function parsetuple(s::AbstractString)
     Tuple(tup), s
 end
 
+struct FixedString{L}
+    data::NTuple{L,UInt8}
+end
+
+Base.String(fs::FixedString) = String(reinterpret(UInt8, fs.data))
+
+function fixedstring(s::Vector{UInt8})
+    return FixedString(s)
+end
+
+Base.unsafe_convert(::Type{Ptr{UInt8}}, fs::FixedString) = Base.unsafe_convert(Ptr{UInt8}, pointer_from_objref(fs))
+
+function string_copy(fs::FixedString{L}) where {L}
+    return String([c for c in fs.data])
+end
+
 function parsedtype(s::AbstractString)
     dtype, s = parsestring(s)
     c = dtype[firstindex(s)]
@@ -135,21 +153,26 @@ function parsedtype(s::AbstractString)
     else
         error("parsing header failed: unsupported endian character $c")
     end
-    if !haskey(Numpy2Julia, t)
+    if haskey(Numpy2Julia, t)
+        (toh, Numpy2Julia[t]), s, 1
+    elseif t[firstindex(t)] == 'U'
+        n = parse(Int, SubString(t, nextind(t, 1)))
+        (toh, UInt32), s, n
+    else
         error("parsing header failed: unsupported type $t")
     end
-    (toh, Numpy2Julia[t]), s
 end
 
 struct Header{T,N,F<:Function}
     descr::F
     fortran_order::Bool
     shape::NTuple{N,Int}
+    isstring::Bool
 end
 
-Header{T}(descr::F, fortran_order, shape::NTuple{N,Int}) where {T,N,F} = Header{T,N,F}(descr, fortran_order, shape)
+Header{T}(descr::F, fortran_order, shape::NTuple{N,Int}, isstring) where {T,N,F} = Header{T,N,F}(descr, fortran_order, shape, isstring)
 Base.size(hdr::Header) = hdr.shape
-Base.eltype(hdr::Header{T}) where T = T
+Base.eltype(hdr::Header{T}) where {T} = T
 Base.ndims(hdr::Header{T,N}) where {T,N} = N
 
 function parseheader(s::AbstractString)
@@ -157,6 +180,7 @@ function parseheader(s::AbstractString)
 
     dict = Dict{String,Any}()
     T = Any
+    k = 1
     for _ in 1:3
         s = strip(s)
         key, s = parsestring(s)
@@ -164,7 +188,7 @@ function parseheader(s::AbstractString)
         s = parsechar(s, ':')
         s = strip(s)
         if key == "descr"
-            (descr, T), s = parsedtype(s)
+            (descr, T), s, k = parsedtype(s)
             dict[key] = descr
         elseif key == "fortran_order"
             dict[key], s = parsebool(s)
@@ -185,7 +209,11 @@ function parseheader(s::AbstractString)
     if s != ""
         error("malformed header")
     end
-    Header{T}(dict["descr"], dict["fortran_order"], dict["shape"])
+
+    if k > 1
+        dict["shape"] = tuple(dict["shape"]..., k)
+    end
+    Header{T}(dict["descr"], dict["fortran_order"], dict["shape"], k > 1)
 end
 
 function readheader(f::IO)
@@ -198,13 +226,21 @@ function readheader(f::IO)
     # support for version 2 files
     if b[1] == 1
         hdrlen = UInt32(readle(f, UInt16))
-    elseif b[1] == 2 
+    elseif b[1] == 2
         hdrlen = UInt32(readle(f, UInt32))
     else
         error("unsupported NPZ version")
     end
     hdr = ascii(String(read!(f, Vector{UInt8}(undef, hdrlen))))
     parseheader(strip(hdr))
+end
+
+function asutf32(s::AbstractVector{UInt32})
+    len = findlast(!iszero, s)
+    if len === nothing
+        return empty_utf32
+    end
+    utf32(s[1:len])
 end
 
 function _npzreadarray(f, hdr::Header{T}) where {T}
@@ -216,6 +252,10 @@ function _npzreadarray(f, hdr::Header{T}) where {T}
         if ndims(x) > 1
             x = permutedims(x, collect(ndims(x):-1:1))
         end
+    end
+
+    if hdr.isstring
+        x = map(asutf32, eachslice(x, dims=Tuple(1:length(hdr.shape)-1)))
     end
     ndims(x) == 0 ? x[1] : x
 end
@@ -286,12 +326,12 @@ function npzread(filename::AbstractString, vars...)
     return data
 end
 
-function npzread(dir::ZipFile.Reader, 
-    vars = map(f -> _maybetrimext(f.name), dir.files))
+function npzread(dir::ZipFile.Reader,
+    vars=map(f -> _maybetrimext(f.name), dir.files))
 
     Dict(_maybetrimext(f.name) => npzreadarray(f)
-        for f in dir.files 
-            if f.name in vars || _maybetrimext(f.name) in vars)
+         for f in dir.files
+         if f.name in vars || _maybetrimext(f.name) in vars)
 end
 
 """
@@ -321,12 +361,12 @@ function readheader(filename::AbstractString, vars...)
     close(f)
     return data
 end
-function readheader(dir::ZipFile.Reader, 
-    vars = map(f -> _maybetrimext(f.name), dir.files))
+function readheader(dir::ZipFile.Reader,
+    vars=map(f -> _maybetrimext(f.name), dir.files))
 
     Dict(_maybetrimext(f.name) => readheader(f)
-        for f in dir.files 
-            if f.name in vars || _maybetrimext(f.name) in vars)
+         for f in dir.files
+         if f.name in vars || _maybetrimext(f.name) in vars)
 end
 
 function npzwritearray(
@@ -338,15 +378,15 @@ function npzwritearray(
     writele(f, NPYMagic)
     writele(f, Version)
 
-    descr =  (ENDIAN_BOM == 0x01020304 ? ">" : "<") * Julia2Numpy[T]
+    descr = (ENDIAN_BOM == 0x01020304 ? ">" : "<") * Julia2Numpy[T]
     dict = "{'descr': '$descr', 'fortran_order': True, 'shape': $(Tuple(shape)), }"
 
     # The dictionary is padded with enough whitespace so that
     # the array data is 16-byte aligned
-    n = length(NPYMagic)+length(Version)+2+length(dict)
-    pad = (div(n+16-1, 16)*16) - n
+    n = length(NPYMagic) + length(Version) + 2 + length(dict)
+    pad = (div(n + 16 - 1, 16) * 16) - n
     if pad > 0
-        dict *= " "^(pad-1) * "\n"
+        dict *= " "^(pad - 1) * "\n"
     end
 
     writele(f, UInt16(length(dict)))
@@ -425,7 +465,7 @@ Dict{String,Any} with 3 entries:
   "y"     => 3
 ```
 """
-function npzwrite(filename::AbstractString, vars::Dict{<:AbstractString}) 
+function npzwrite(filename::AbstractString, vars::Dict{<:AbstractString})
     dir = ZipFile.Writer(filename)
 
     if length(vars) == 0
@@ -442,8 +482,8 @@ function npzwrite(filename::AbstractString, vars::Dict{<:AbstractString})
 end
 
 function npzwrite(filename::AbstractString, args...; kwargs...)
-    dkwargs = Dict(string(k) => v for (k,v) in kwargs)
-    dargs = Dict("arr_"*string(i-1) => v for (i,v) in enumerate(args))
+    dkwargs = Dict(string(k) => v for (k, v) in kwargs)
+    dargs = Dict("arr_" * string(i - 1) => v for (i, v) in enumerate(args))
 
     d = convert(Dict{String,Any}, merge(dargs, dkwargs))
 
